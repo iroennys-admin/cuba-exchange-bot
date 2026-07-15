@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -134,29 +134,52 @@ def rates_changed(old: dict | None, new: dict) -> bool:
     return False
 
 
+def _fmt_date(raw: str) -> str:
+    """Turn DD/MM/YYYY into 'DD de mes de YYYY'."""
+    meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    try:
+        d, m, y = raw.split("/")
+        return f"{int(d)} de {meses[int(m)]} de {y}"
+    except (ValueError, IndexError):
+        return raw
+
+
+# ponytail: box-drawing table with fixed col widths. If Telegram changes monospace
+# rendering, fall back to pipe-separated plain text.
+def _row_inner(label: str, sym: str, val_str: str, range_str: str) -> str:
+    """Build inner content of a data row (without ││ frame)."""
+    return f" {label} {sym}{val_str} CUP {range_str}"
+
+
 def format_rates(rates: dict, *, header: str = "") -> str:
     """Format rates into a clean monospace table."""
-    date_str = rates.get("date_raw", "hoy")
+    W = 32  # total width including frame
+    IW = W - 2  # inner width between ││
+    sep = "─" * IW
+
+    date_str = _fmt_date(rates.get("date_raw", "hoy"))
     t = header or "TASAS DEL DÍA"
-    w = 26
-    sep = "─" * w
 
     rows = [
         f"┌{sep}┐",
-        f"│ {t:<{w-2}} │",
-        f"│ {date_str:<{w-2}} │",
+        f"│{t:^{IW}}│",
+        f"│{date_str:^{IW}}│",
         f"├{sep}┤",
     ]
+    SYM = {"usd": "$", "eur": "€", "mlc": ""}
     for coin, label in (("usd", "USD"), ("eur", "EUR"), ("mlc", "MLC")):
         val = rates.get(coin)
         lo = rates.get(f"{coin}_min")
         hi = rates.get(f"{coin}_max")
+        sym = SYM[coin]
         if val is not None:
-            r = f"  [{lo:.0f}-{hi:.0f}]" if lo and hi else ""
-            rest = f"{r:<12}"
-            rows.append(f"│ {label}  {val:>8.2f} CUP{rest}│")
+            r = f"[{lo:.0f}–{hi:.0f}]" if lo and hi else ""
+            inner = _row_inner(label, sym, f"{val:>7.2f}", r)
+            rows.append(f"│{inner:<{IW}}│")
         else:
-            rows.append(f"│ {label}      —           │")
+            inner = f" {label} {sym} —"
+            rows.append(f"│{inner:<{IW}}│")
     rows.append(f"└{sep}┘")
     rows.append(f"@eltoquecom · {datetime.now().strftime('%H:%M UTC')}")
     return "\n".join(rows)
@@ -179,9 +202,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Consultá el precio del dólar, euro y MLC en el mercado "
         "informal cubano, actualizado desde @eltoquecom.\n\n"
         "📌 *Comandos:*\n"
-        "  /tasas — Mostrar cotizaciones del día\n"
-        "  /moneda USD|EUR|MLC — Cotización específica\n"
-        "  /sub — Activar notificaciones diarias\n"
+        "  /tasas — Cotizaciones USD, EUR, MLC\n"
+        "  /moneda USD — Cotización específica\n"
+        "  /convertir 100 USD — Conversión CUP ↔ moneda\n"
+        "  /sub — Notificaciones diarias\n"
         "  /unsub — Desactivar notificaciones\n"
         "  /ayuda — Esta ayuda\n\n"
         f"_{rates.get('date_raw', '—')}_\n"
@@ -224,22 +248,92 @@ async def moneda(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ No hay datos para {coin} hoy.")
         return
 
+    SYM = {"usd": "$", "eur": "€", "mlc": ""}
+    sym = SYM[key]
     sep = "─" * 22
     lines = [
         f"┌{sep}┐",
-        f"│ 💱 {coin:<17} │",
+        f"│ 💱 {coin}{' '+sym if sym else ''}               │",
         f"├{sep}┤",
-        f"│ Tasa:  {val:>8.2f} CUP     │",
+        f"│ Tasa:  {sym}{val:>7.2f} CUP    │",
     ]
     if lo and hi:
-        lines.append(f"│ Rango: {lo:.0f}–{hi:.0f} CUP      │")
+        lines.append(f"│ Rango: {sym}{lo:.0f}–{sym}{hi:.0f} CUP   │")
     lines.append(f"└{sep}┘")
-    lines.append(f"@eltoquecom · {rates.get('date_raw', '—')}")
+    lines.append(f"@eltoquecom · {_fmt_date(rates.get('date_raw', '—'))}")
 
     await update.message.reply_text(
         f"```\n{chr(10).join(lines)}\n```",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def convertir(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Convert CUP ↔ USD/EUR/MLC at current rate."""
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usá: `/convertir 100 USD` o `/convertir 5000 CUP USD`\n"
+            "Convierte entre CUP y USD, EUR o MLC.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    rates = await _ensure_fresh_rates(update)
+    if not rates:
+        return
+
+    try:
+        amount = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ El monto no es válido. Ej: `/convertir 100 USD`")
+        return
+
+    from_coin = args[1].upper()
+    to_coin = args[2].upper() if len(args) > 2 else "CUP"
+
+    SYM = {"usd": "$", "eur": "€", "mlc": "", "cup": "$"}
+
+    if from_coin == "CUP" and to_coin in ("USD", "EUR", "MLC"):
+        key = to_coin.lower()
+        rate = rates.get(key)
+        if not rate or rate == 0:
+            await update.message.reply_text(f"❌ No hay tasa disponible para {to_coin}.")
+            return
+        result = amount / rate
+        from_sym, to_sym = SYM["cup"], SYM[key]
+        reply = (
+            f"💱 *{from_coin} → {to_coin}*\n"
+            f"```\n"
+            f"{from_sym}{amount:>10.2f} CUP\n"
+            f"  →  {to_sym}{result:>9.2f} {to_coin}\n"
+            f"```\n"
+            f"_Tasa: {SYM[key] if to_sym else ''}{rate:.2f} CUP por {to_coin}_"
+        )
+    elif to_coin == "CUP" and from_coin in ("USD", "EUR", "MLC"):
+        key = from_coin.lower()
+        rate = rates.get(key)
+        if not rate:
+            await update.message.reply_text(f"❌ No hay tasa disponible para {from_coin}.")
+            return
+        result = amount * rate
+        from_sym, to_sym = SYM[key], SYM["cup"]
+        reply = (
+            f"💱 *{from_coin} → {to_coin}*\n"
+            f"```\n"
+            f"{from_sym if from_sym else from_coin}{amount:>9.2f} {from_coin}\n"
+            f"  →  {to_sym}{result:>9.2f} CUP\n"
+            f"```\n"
+            f"_Tasa: {rate:.2f} CUP por {from_coin}_"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Solo soporto CUP ↔ USD/EUR/MLC.\n"
+            "Ej: `/convertir 50 USD` o `/convertir 5000 CUP EUR`"
+        )
+        return
+
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
 
 async def subscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,13 +443,29 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+async def post_init(app: Application) -> None:
+    """Register bot commands with Telegram on startup."""
+    commands = [
+        BotCommand("start", "Bienvenida y suscripción"),
+        BotCommand("tasas", "Cotizaciones USD, EUR, MLC"),
+        BotCommand("moneda", "Cotización específica: /moneda USD"),
+        BotCommand("convertir", "Convertir CUP ↔ USD/EUR/MLC"),
+        BotCommand("sub", "Activar notificaciones diarias"),
+        BotCommand("unsub", "Desactivar notificaciones"),
+        BotCommand("ayuda", "Esta ayuda"),
+    ]
+    await app.bot.set_my_commands(commands)
+    log.info("Bot commands registered")
+
+
 def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tasas", tasas))
     app.add_handler(CommandHandler("moneda", moneda))
+    app.add_handler(CommandHandler("convertir", convertir))
     app.add_handler(CommandHandler("sub", subscribe))
     app.add_handler(CommandHandler("unsub", unsubscribe))
     app.add_handler(CommandHandler("ayuda", help_cmd))
