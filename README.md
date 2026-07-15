@@ -39,15 +39,12 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 > ⚠️ Codespaces se apaga a los 30 min de inactividad. No es ideal para un bot 24/7.
 
-### ☁️ Railway (recomendado — 24/7 gratis)
+### ☁️ Despliegue directo (un clic + token)
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/Iroennys/cuba-exchange-bot)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/iroennys-admin/cuba-exchange-bot)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/iroennys-admin/cuba-exchange-bot)
 
-1. Cloná el repo: `git clone https://github.com/Iroennys/cuba-exchange-bot`
-2. En [Railway](https://railway.app) creá un nuevo proyecto desde tu repo
-3. Agregá la variable `BOT_TOKEN`
-4. Railway buildpea solo con el `Dockerfile` incluido
-5. El bot arranca solo y **no se apaga**
+Render y Railway te crean el proyecto y te **piden solo el token** al desplegar. Pegás el token de [@BotFather](https://t.me/BotFather) y el bot arranca solo. Sin servidores, sin config.
 
 ### 📱 Termux (Android)
 
