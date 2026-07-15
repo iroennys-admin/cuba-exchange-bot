@@ -1,0 +1,8 @@
+docker:
+  image: cuba-exchange-bot
+  dockerfile: Dockerfile
+env:
+  - key: BOT_TOKEN
+    value: ""
+    secret: true
+    required: true

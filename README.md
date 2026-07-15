@@ -43,8 +43,9 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/iroennys-admin/cuba-exchange-bot)
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/iroennys-admin/cuba-exchange-bot)
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=cuba-exchange-bot&type=docker&repository=iroennys-admin/cuba-exchange-bot&branch=master&env%5BBOT_TOKEN%5D=)
 
-Render y Railway te piden **solo el token** y el bot arranca solo. Sin servidores, sin config.
+Render, Railway y Koyeb te piden **solo el token** y el bot arranca solo. Sin servidores, sin config.
 
 ### 🆓 Más opciones gratis 24/7
 
