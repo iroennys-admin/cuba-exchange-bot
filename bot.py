@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, time as dtime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
@@ -458,7 +460,28 @@ async def post_init(app: Application) -> None:
     log.info("Bot commands registered")
 
 
+# ponytail: health-check server for platforms that kill apps without an open port
+# (Koyeb, Render, etc.). No framework, stdlib http.server. One thread, no io.
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *_: Any) -> None:
+        pass  # silence logs
+
+
+def _start_health_server() -> None:
+    port = int(os.environ.get("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info("Health server on port %d", port)
+
+
 def main() -> None:
+    _start_health_server()
+
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Commands
@@ -474,13 +497,11 @@ def main() -> None:
     # Schedules
     jq = app.job_queue
     if jq is not None:
-        # Check for rate changes every CHECK_INTERVAL_MIN minutes
         jq.run_repeating(
             check_rates,
             interval=CHECK_INTERVAL_MIN * 60,
-            first=30,  # first run after 30s
+            first=30,
         )
-        # Daily summary at DAILY_HOUR UTC
         jq.run_daily(
             daily_summary,
             time=dtime(hour=DAILY_HOUR, minute=0),

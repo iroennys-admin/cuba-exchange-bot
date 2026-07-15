@@ -1,6 +1,9 @@
 docker:
   image: cuba-exchange-bot
   dockerfile: Dockerfile
+ports:
+  - port: 8000
+    protocol: http
 env:
   - key: BOT_TOKEN
     value: ""
