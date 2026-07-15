@@ -1,0 +1,5 @@
+rates.json
+subscribers.json
+__pycache__/
+*.pyc
+.env
