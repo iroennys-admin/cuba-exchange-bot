@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 from datetime import datetime, time as dtime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -22,10 +23,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import requests
 from bs4 import BeautifulSoup
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineQueryResultArticle, InputTextMessageContent, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, InlineQueryHandler
 
 # ---------------------------------------------------------------------------
 # Config
@@ -207,9 +209,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "  /tasas — Cotizaciones USD, EUR, MLC\n"
         "  /moneda USD — Cotización específica\n"
         "  /convertir 100 USD — Conversión CUP ↔ moneda\n"
+        "  /explore django — Buscar repos en GitHub\n"
+        "  /clone user/repo — Descargar ZIP de GitHub\n"
         "  /sub — Notificaciones diarias\n"
         "  /unsub — Desactivar notificaciones\n"
-        "  /ayuda — Esta ayuda\n\n"
+        "  /ayuda — Ayuda completa\n\n"
         f"_{rates.get('date_raw', '—')}_\n"
         "Creado por @nautaii"
     )
@@ -448,13 +452,16 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(app: Application) -> None:
     """Register bot commands with Telegram on startup."""
     commands = [
-        BotCommand("start", "Bienvenida y suscripción"),
+        BotCommand("start", "Bienvenida"),
         BotCommand("tasas", "Cotizaciones USD, EUR, MLC"),
-        BotCommand("moneda", "Cotización específica: /moneda USD"),
+        BotCommand("moneda", "Cotización específica"),
         BotCommand("convertir", "Convertir CUP ↔ USD/EUR/MLC"),
-        BotCommand("sub", "Activar notificaciones diarias"),
+        BotCommand("explore", "Buscar repos en GitHub"),
+        BotCommand("clone", "Descargar ZIP de GitHub"),
+        BotCommand("branches", "Branches de un repo"),
+        BotCommand("sub", "Activar notificaciones"),
         BotCommand("unsub", "Desactivar notificaciones"),
-        BotCommand("ayuda", "Esta ayuda"),
+        BotCommand("ayuda", "Ayuda completa"),
     ]
     await app.bot.set_my_commands(commands)
     log.info("Bot commands registered")
@@ -479,6 +486,158 @@ def _start_health_server() -> None:
     log.info("Health server on port %d", port)
 
 
+# ---------------------------------------------------------------------------
+# GitHub DL — buscar y descargar repos
+# ---------------------------------------------------------------------------
+# ponytail: sin rate-limit backoff. Agregar token+retry si aparecen 403s.
+GITHUB_API = "https://api.github.com"
+MAX_DL = int(os.environ.get("MAX_DL_MB", "200")) << 20
+
+def gh_get(path: str, **kw: Any) -> Any:
+    r = requests.get(f"{GITHUB_API}{path}", timeout=15, **kw)
+    r.raise_for_status()
+    return r.json()
+
+def search_repos(query: str, per_page: int = 10) -> list:
+    return gh_get("/search/repositories", params={"q": query, "per_page": per_page}).get("items", [])
+
+def get_repo(full_name: str) -> dict:
+    return gh_get(f"/repos/{full_name}")
+
+def get_branches(full_name: str) -> list:
+    return gh_get(f"/repos/{full_name}/branches")
+
+def parse_repo(text: str) -> str:
+    s = text.split(maxsplit=1)[-1] if " " in text else text
+    s = s.strip().replace("https://github.com/", "").replace("http://github.com/", "").rstrip("/")
+    parts = s.split("/")
+    return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 and parts[0] and parts[1] else ""
+
+async def download_repo(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                        full_name: str, branch: str | None = None) -> None:
+    msg = update.effective_message
+    status = await msg.reply_text(f"⏳ `{full_name}`…", parse_mode=ParseMode.MARKDOWN)
+    try:
+        repo = get_repo(full_name)
+    except requests.HTTPError as e:
+        return await status.edit_text(f"❌ `{full_name}` — {e.response.status_code}")
+    if repo.get("size", 0) * 2048 > MAX_DL:
+        return await status.edit_text(f"❌ Muy grande ({repo['size']>>10}MB)")
+    branch = branch or repo.get("default_branch", "main")
+    dl_url = f"https://github.com/{full_name}/archive/refs/heads/{branch}.zip"
+    await status.edit_text(f"📥 `{full_name}` / `{branch}`…", parse_mode=ParseMode.MARKDOWN)
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    try:
+        r = requests.get(dl_url, stream=True, timeout=300)
+        r.raise_for_status()
+        for chunk in r.iter_content(1 << 14):
+            if chunk:
+                tmp.write(chunk)
+        tmp.close()
+        sz = os.path.getsize(tmp.name)
+        if sz > MAX_DL:
+            return await _cleanup(tmp.name, status, f"❌ ZIP muy grande ({sz>>20}MB)")
+        await status.edit_text("⬆️ Subiendo…")
+        await msg.reply_document(
+            tmp.name,
+            file_name=f"{full_name.replace('/', '_')}_{branch}.zip",
+            caption=f"📦 `{full_name}` (`{branch}`)",
+            parse_mode=ParseMode.MARKDOWN)
+        await status.delete()
+    except requests.HTTPError as e:
+        err = "Branch no existe" if e.response.status_code == 404 else f"HTTP {e.response.status_code}"
+        await status.edit_text(f"❌ {err}")
+    except Exception as e:
+        await status.edit_text(f"❌ {e}")
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+async def _cleanup(path: str, msg, text: str) -> None:
+    if os.path.exists(path):
+        os.unlink(path)
+    await msg.edit_text(text)
+
+# ── GitHub command handlers ──
+
+async def cmd_explore(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.message.text[len("/explore"):].strip()
+    if not q:
+        return await update.message.reply_text("Usá `/explore nombre-de-repo`", parse_mode=ParseMode.MARKDOWN)
+    repos = search_repos(q)
+    if not repos:
+        return await update.message.reply_text("Sin resultados.")
+    for r in repos[:5]:
+        fn = r["full_name"]
+        desc = (r.get("description") or "")[:200]
+        info = (
+            f"📦 **{fn}**\n{desc}\n"
+            f"⭐ {r['stargazers_count']}  🍴 {r['forks_count']}  📐 {r.get('language') or '?'}"
+        )
+        await update.message.reply_text(
+            info, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 Download", callback_data=f"dl|{fn}"),
+                InlineKeyboardButton("🌿 Branches", callback_data=f"br|{fn}"),
+            ]]))
+
+async def cmd_clone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = update.message.text.split(maxsplit=2)
+    fn = parse_repo(parts[1]) if len(parts) > 1 else ""
+    branch = parts[2].strip() if len(parts) > 2 else None
+    if not fn:
+        return await update.message.reply_text("Usá `/clone user/repo [branch]`", parse_mode=ParseMode.MARKDOWN)
+    await download_repo(update, ctx, fn, branch)
+
+async def cmd_branches(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    fn = parse_repo(update.message.text[len("/branches"):])
+    if not fn:
+        return await update.message.reply_text("Usá `/branches user/repo`", parse_mode=ParseMode.MARKDOWN)
+    try:
+        branches = get_branches(fn)
+    except requests.HTTPError as e:
+        return await update.message.reply_text(f"❌ `{fn}` — {e.response.status_code}")
+    text = "🌿 **" + fn + "** branches:\n" + "\n".join(f"• `{b['name']}`" for b in branches[:30])
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def inline_search(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.inline_query.query.strip()
+    if not q:
+        return await update.inline_query.answer([], cache_time=0,
+            switch_pm_text="🔍 Buscar repos en GitHub",
+            switch_pm_parameter="s")
+    repos = search_repos(q)
+    results = []
+    for r in repos[:15]:
+        fn = r["full_name"]
+        desc = (r.get("description") or "")[:120]
+        results.append(InlineQueryResultArticle(
+            id=fn,
+            title=f"⭐ {r['stargazers_count']}  {fn}",
+            description=desc or "(sin descripción)",
+            input_message_content=InputTextMessageContent(
+                f"📦 **{fn}**\n{(r.get('description') or '')[:300]}\n"
+                f"⭐ {r['stargazers_count']}  🍴 {r['forks_count']}\n\n"
+                f"Usá /clone {fn} para descargar",
+                parse_mode=ParseMode.MARKDOWN)))
+    await update.inline_query.answer(results, cache_time=30, is_personal=True)
+
+async def gh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cb = update.callback_query
+    await cb.answer()
+    action, fn = cb.data.split("|", 1)
+    if action == "dl":
+        await download_repo(update, ctx, fn)
+    elif action == "br":
+        try:
+            branches = get_branches(fn)
+        except requests.HTTPError as e:
+            return await cb.message.reply_text(f"❌ `{fn}` — {e.response.status_code}")
+        text = "🌿 **" + fn + "** branches:\n" + "\n".join(f"• `{b['name']}`" for b in branches[:30])
+        await cb.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await cb.message.delete()
+
+
 def main() -> None:
     _start_health_server()
 
@@ -489,9 +648,14 @@ def main() -> None:
     app.add_handler(CommandHandler("tasas", tasas))
     app.add_handler(CommandHandler("moneda", moneda))
     app.add_handler(CommandHandler("convertir", convertir))
+    app.add_handler(CommandHandler("explore", cmd_explore))
+    app.add_handler(CommandHandler("clone", cmd_clone))
+    app.add_handler(CommandHandler("branches", cmd_branches))
     app.add_handler(CommandHandler("sub", subscribe))
     app.add_handler(CommandHandler("unsub", unsubscribe))
     app.add_handler(CommandHandler("ayuda", help_cmd))
+    app.add_handler(InlineQueryHandler(inline_search))
+    app.add_handler(CallbackQueryHandler(gh_callback, pattern=r"^(dl|br)\|."))
     app.add_error_handler(error_handler)
 
     # Schedules
