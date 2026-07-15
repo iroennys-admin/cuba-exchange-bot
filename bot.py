@@ -540,7 +540,7 @@ async def download_repo(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await status.edit_text("⬆️ Subiendo…")
         await msg.reply_document(
             tmp.name,
-            file_name=f"{full_name.replace('/', '_')}_{branch}.zip",
+            filename=f"{full_name.replace('/', '_')}_{branch}.zip",
             caption=f"📦 `{full_name}` (`{branch}`)",
             parse_mode=ParseMode.MARKDOWN)
         await status.delete()
