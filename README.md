@@ -17,57 +17,51 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 ## 🚀 Cómo usarlo
 
-1. Hablá con el bot en Telegram (cuando esté desplegado)
+1. Hablá con el bot en Telegram: [@eltoquecubabot](https://t.me/eltoquecubabot)
 2. Enviá `/start` para registrarte
 3. Usá `/tasas` para ver las cotizaciones del día
 4. Usá `/sub` para recibir actualizaciones automáticas
 
-## 🛠️ Instalación y despliegue
+## 🛠️ Despliegue
 
 ### Requisitos
 
 - Python 3.10+
 - Un token de bot de Telegram (de [@BotFather](https://t.me/BotFather))
 
-### Instalación
+### 🖥️ GitHub Codespaces (desarrollo)
+
+[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Iroennys/cuba-exchange-bot)
+
+1. Creá un **secret** en tu repositorio: `Settings → Secrets and variables → Codespaces` → `BOT_TOKEN` con el token de tu bot
+2. Abrí el repositorio en Codespaces
+3. Se instala solo y arranca el bot
+
+> ⚠️ Codespaces se apaga a los 30 min de inactividad. No es ideal para un bot 24/7.
+
+### ☁️ Railway (recomendado — 24/7 gratis)
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/Iroennys/cuba-exchange-bot)
+
+1. Cloná el repo: `git clone https://github.com/Iroennys/cuba-exchange-bot`
+2. En [Railway](https://railway.app) creá un nuevo proyecto desde tu repo
+3. Agregá la variable `BOT_TOKEN`
+4. Railway buildpea solo con el `Dockerfile` incluido
+5. El bot arranca solo y **no se apaga**
+
+### 📱 Termux (Android)
 
 ```bash
-# Clonar el repositorio
-git clone https://github.com/Iroennys/cuba-exchange-bot.git
-cd cuba-exchange-bot
-
-# Instalar dependencias
+pkg install python tmux
 pip install -r requirements.txt
-
-# Configurar el token
 export BOT_TOKEN="tu_token_aqui"
-
-# Ejecutar
-python bot.py
-```
-
-### Despliegue en Termux (Android)
-
-```bash
-# Instalar dependencias
-pkg install python
-pip install -r requirements.txt
-
-# Configurar token
-echo 'export BOT_TOKEN="tu_token_aqui"' >> ~/.bashrc
-source ~/.bashrc
-
-# Mantener el dispositivo despierto
 termux-wake-lock
-
-# Ejecutar en sesión persistente (tmux)
-pkg install tmux
 tmux new -s cubabot
 python bot.py
 # Ctrl+B, D para desacoplar
 ```
 
-### Despliegue con systemd (Linux)
+### 🐧 systemd (Linux)
 
 ```ini
 [Unit]
@@ -79,7 +73,7 @@ Type=simple
 User=tu_usuario
 WorkingDirectory=/path/to/cuba-exchange-bot
 Environment="BOT_TOKEN=tu_token_aqui"
-ExecStart=/usr/bin/python3 /path/to/cuba-exchange-bot/bot.py
+ExecStart=/usr/bin/python3 bot.py
 Restart=on-failure
 RestartSec=30
 
