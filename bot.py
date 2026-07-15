@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 import requests
 from bs4 import BeautifulSoup
-from telegram import BotCommand, InlineQueryResultArticle, InputTextMessageContent, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, InlineQueryHandler
 

@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]>=22
 httpx>=0.28
 beautifulsoup4>=4
+requests>=2
