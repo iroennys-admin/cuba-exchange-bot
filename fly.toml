@@ -1,0 +1,15 @@
+# fly.toml — Cuba Exchange Bot
+# 1. fly launch --copy-config --no-deploy
+# 2. fly secrets set BOT_TOKEN=tu_token
+# 3. fly deploy
+app = "cuba-exchange-bot"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # No HTTP needed, bot polls Telegram directly. Set token via fly secrets.
+  # BOT_TOKEN will be set via `fly secrets set BOT_TOKEN=...`
+
+# No [[services]] block — this is a background worker, not a web app.
+# It connects outbound to Telegram, no incoming ports needed.

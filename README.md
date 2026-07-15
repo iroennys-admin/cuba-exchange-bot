@@ -39,12 +39,20 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 > ⚠️ Codespaces se apaga a los 30 min de inactividad. No es ideal para un bot 24/7.
 
-### ☁️ Despliegue directo (un clic + token)
+### ⚡ Un clic + token
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/iroennys-admin/cuba-exchange-bot)
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/iroennys-admin/cuba-exchange-bot)
 
-Render y Railway te crean el proyecto y te **piden solo el token** al desplegar. Pegás el token de [@BotFather](https://t.me/BotFather) y el bot arranca solo. Sin servidores, sin config.
+Render y Railway te piden **solo el token** y el bot arranca solo. Sin servidores, sin config.
+
+### 🆓 Más opciones gratis 24/7
+
+| Plataforma | Free tier | Setup |
+|------------|-----------|-------|
+| [Fly.io](https://fly.io) | 3 apps siempre activas | `fly launch` desde el repo |
+| [Koyeb](https://koyeb.com) | 1 app siempre activa | Conectar repo, poner `BOT_TOKEN` |
+| [Oracle Cloud](https://oracle.com/cloud/free) | VM ARM 4C/24GB **permanente** | SSH, instalación manual |
 
 ### 📱 Termux (Android)
 
