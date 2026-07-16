@@ -33,6 +33,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from database import init_db, ensure_user, get_user, set_github_token, set_github_user, \
     set_mode, subscribe as db_sub, unsubscribe as db_unsub, get_subscribers, is_subscribed
 from github_client import GitHubClient, GitHubError
+from proxies import scrape_all, test_batch
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1051,6 +1052,36 @@ async def _gh_do_search(chat_id: int, msg, token: str, query: str, ctx) -> None:
         await msg.reply_text(f"❌ {e}")
 
 
+async def cmd_proxies(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scrape and test free proxies from multiple sources."""
+    msg = await update.message.reply_text("🔍 Scrapeando proxies gratuitos de 8 fuentes…")
+
+    # Scrape
+    all_proxies = await asyncio.to_thread(scrape_all)
+    if not all_proxies:
+        return await msg.edit_text("❌ No se encontraron proxies.")
+
+    await msg.edit_text(f"🔎 Probando {len(all_proxies)} proxies…\n⏳ Esto puede tomar unos minutos.")
+
+    # Test in batches
+    working = await test_batch(all_proxies, batch_size=50)
+
+    if not working:
+        return await msg.edit_text("❌ Ningún proxy funcionó.")
+
+    # Send results
+    chunks = [working[i:i+50] for i in range(0, len(working), 50)]
+    lines = [f"✅ *{len(working)} proxies funcionando* de {len(all_proxies)} totales\n"]
+    for chunk in chunks:
+        chunk_text = "\n".join(f"`{p}`" for p in chunk)
+        if len(lines) > 1:  # not first chunk → new message
+            await update.message.reply_text(chunk_text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            lines.append(chunk_text)
+
+    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current conversation workflow."""
     chat_id = update.effective_chat.id
@@ -1135,6 +1166,8 @@ async def post_init(app: Application) -> None:
         BotCommand("branches", "Branches de un repo"),
         BotCommand("github", "Menú GitHub completo"),
         BotCommand("mode", "Cambiar modo Normal/GitHub"),
+        BotCommand("proxies", "Obtener proxies gratuitos"),
+        BotCommand("proxies", "Obtener proxies gratuitos"),
         BotCommand("settoken", "Configurar token de GitHub"),
         BotCommand("sub", "Activar notificaciones"),
         BotCommand("unsub", "Desactivar notificaciones"),
@@ -1371,6 +1404,7 @@ def main() -> None:
     app.add_handler(CommandHandler("github", cmd_github))
     app.add_handler(CommandHandler("settoken", cmd_settoken))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("proxies", cmd_proxies))
 
     # Old-style GitHub commands (keep for compat)
     app.add_handler(CommandHandler("explore", cmd_explore))
