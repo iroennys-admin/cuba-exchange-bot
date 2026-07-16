@@ -39,7 +39,7 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 > ⚠️ Codespaces se apaga a los 30 min de inactividad. No es ideal para un bot 24/7.
 
-> 🐙 El bot ahora incluye un **modo GitHub** completo con `/github`. Configurá tu token con `/settoken`.
+> 🐙 El bot incluye un **modo GitHub** completo con `/github`. Configurá tu token con `/settoken`.
 
 ### ⚡ Un clic + token
 
@@ -48,6 +48,15 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=cuba-exchange-bot&type=docker&repository=iroennys-admin/cuba-exchange-bot&branch=master&env%5BBOT_TOKEN%5D=&env%5BZEN_API_KEY%5D=)
 
 Render, Railway y Koyeb te piden **solo el token** y el bot arranca solo. Sin servidores, sin config.
+
+### 🐳 Docker (ghcr.io)
+
+Cada push a `master` publica automáticamente una imagen en GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/iroennys-admin/cuba-exchange-bot:latest
+docker run -e BOT_TOKEN=tu_token -e ZEN_API_KEY=tu_key ghcr.io/iroennys-admin/cuba-exchange-bot
+```
 
 ### 🆓 Más opciones gratis 24/7
 
