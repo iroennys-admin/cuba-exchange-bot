@@ -3,3 +3,5 @@ subscribers.json
 __pycache__/
 *.pyc
 .env
+# Local Pi runtime state
+.atl/

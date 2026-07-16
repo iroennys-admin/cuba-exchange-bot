@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from datetime import datetime, time as dtime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -27,7 +28,11 @@ import requests
 from bs4 import BeautifulSoup
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, InlineQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, InlineQueryHandler, MessageHandler, filters
+
+from database import init_db, ensure_user, get_user, set_github_token, set_github_user, \
+    set_mode, subscribe as db_sub, unsubscribe as db_unsub, get_subscribers, is_subscribed
+from github_client import GitHubClient, GitHubError
 
 # ---------------------------------------------------------------------------
 # Config
@@ -39,9 +44,16 @@ if not TOKEN:
 CHANNEL_URL = "https://t.me/s/eltoquecom"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 RATES_FILE = DATA_DIR / "rates.json"
-SUBS_FILE = DATA_DIR / "subscribers.json"
 CHECK_INTERVAL_MIN = 30  # how often to check for rate changes
 DAILY_HOUR = 9           # daily summary hour (UTC)
+
+# Conversation state for multi-step workflows (in-memory, OK if bot restarts)
+conv: dict[int, dict] = {}
+
+# Optional — Zen AI (opencode.ai/zen) + autoping
+ZEN_API_KEY = os.environ.get("ZEN_API_KEY", "")
+ZEN_API_URL = os.environ.get("ZEN_API_URL", "https://opencode.ai/zen/v1/chat/completions")
+RENDER_URL = os.environ.get("RENDER_URL", "")  # for autoping (set on deploy)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,13 +87,6 @@ def load_rates() -> dict[str, Any]:
 def save_rates(rates: dict[str, Any]) -> None:
     _save_json(RATES_FILE, rates)
 
-def load_subs() -> dict[str, list[int]]:
-    """Returns {chat_id: [chat_id]} — simple set of subscriber chat IDs."""
-    return _load_json(SUBS_FILE)
-
-def save_subs(subs: dict[str, list[int]]) -> None:
-    _save_json(SUBS_FILE, subs)
-
 # ---------------------------------------------------------------------------
 # Scraper
 # ---------------------------------------------------------------------------
@@ -106,6 +111,32 @@ def parse_rate_message(text: str) -> dict[str, Any] | None:
             rates[f"{coin.lower()}_max"] = float(m.group(2).replace(",", ""))
 
     return rates if any(k in rates for k in ("usd", "eur", "mlc")) else None
+
+
+# ---------------------------------------------------------------------------
+# Zen AI — OpenCode API (OpenAI-compatible)
+# ---------------------------------------------------------------------------
+# ponytail: single-shot non-streaming. Streaming + context memory if users ask.
+async def call_zen_ai(prompt: str, model: str = "big-pickle") -> str:
+    """Send a prompt to the OpenCode Zen API and return the response text."""
+    if not ZEN_API_KEY:
+        return "❌ ZEN_API_KEY no configurada."
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                ZEN_API_URL,
+                headers={"Authorization": f"Bearer {ZEN_API_KEY}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024},
+            )
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            return msg["content"] or msg.get("reasoning_content", "") or "Sin respuesta"
+    except httpx.HTTPStatusError as e:
+        return f"❌ Error HTTP {e.response.status_code}" if e.response else "❌ Error de conexión"
+    except (KeyError, IndexError, TypeError):
+        return "❌ Respuesta inesperada de la API"
+    except Exception as e:
+        return f"❌ {e}"
 
 
 async def fetch_latest_rates() -> dict[str, Any] | None:
@@ -194,27 +225,30 @@ def format_rates(rates: dict, *, header: str = "") -> str:
 # ---------------------------------------------------------------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    subs = load_subs()
-    if str(chat_id) not in subs:
-        subs[str(chat_id)] = [chat_id]
-        save_subs(subs)
+    ensure_user(chat_id)
+    if not is_subscribed(chat_id):
+        db_sub(chat_id)
         log.info("New subscriber: %s", chat_id)
 
     rates = load_rates()
+    date_str = rates.get('date_raw', '—')
     msg = (
         "👋 *Bienvenido al Bot de Tasas de Cuba*\n\n"
         "Consultá el precio del dólar, euro y MLC en el mercado "
         "informal cubano, actualizado desde @eltoquecom.\n\n"
         "📌 *Comandos:*\n"
-        "  /tasas — Cotizaciones USD, EUR, MLC\n"
-        "  /moneda USD — Cotización específica\n"
-        "  /convertir 100 USD — Conversión CUP ↔ moneda\n"
-        "  /explore django — Buscar repos en GitHub\n"
-        "  /clone user/repo — Descargar ZIP de GitHub\n"
-        "  /sub — Notificaciones diarias\n"
-        "  /unsub — Desactivar notificaciones\n"
-        "  /ayuda — Ayuda completa\n\n"
-        f"_{rates.get('date_raw', '—')}_\n"
+        "  💱 /tasas — Cotizaciones USD, EUR, MLC\n"
+        "  🪙 /moneda USD — Cotización específica\n"
+        "  🔄 /convertir 100 USD — Conversión CUP ↔ moneda\n"
+        "  🧘 /asesor — Análisis IA de tasas\n"
+        "  🐙 /explore django — Buscar repos en GitHub\n"
+        "  📥 /clone user/repo — Descargar ZIP de GitHub\n"
+        "  🐙 /github — Menú GitHub completo\n"
+        "  🔔 /sub — Notificaciones diarias\n"
+        "  🔕 /unsub — Desactivar notificaciones\n"
+        "  ⚙️ /mode — Cambiar modo Normal/GitHub\n"
+        "  ❓ /ayuda — Ayuda completa\n\n"
+        f"_{date_str}_\n"
         "Creado por @nautaii"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -344,9 +378,7 @@ async def convertir(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def subscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    subs = load_subs()
-    subs[str(chat_id)] = [chat_id]
-    save_subs(subs)
+    db_sub(chat_id)
     await update.message.reply_text(
         "✅ Notificaciones activadas. Recibirás la tasa cada día "
         f"~{DAILY_HOUR:02d}:00 UTC y cuando haya cambios."
@@ -355,14 +387,35 @@ async def subscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def unsubscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    subs = load_subs()
-    subs.pop(str(chat_id), None)
-    save_subs(subs)
-    await update.message.reply_text("❌ Notificaciones desactivadas.")
+    db_unsub(chat_id)
+    await update.message.reply_text("🔕 Notificaciones desactivadas.")
 
 
 async def help_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, _ctx)
+
+
+async def cmd_asesor(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """AI-powered rate analysis via Zen API."""
+    rates = await _ensure_fresh_rates(update)
+    if not rates:
+        return
+    q = update.message.text[len("/asesor"):].strip()
+    prompt = (
+        f"Eres un analista financiero experto en el mercado informal cubano (CUP).\n\n"
+        f"Tasas actuales del día ({rates.get('date_raw', 'hoy')}):\n"
+        f"- USD: ${rates.get('usd', 'N/A'):.2f} CUP (rango: ${rates.get('usd_min', 0):.0f}–${rates.get('usd_max', 0):.0f})\n"
+        f"- EUR: €{rates.get('eur', 'N/A'):.2f} CUP (rango: €{rates.get('eur_min', 0):.0f}–€{rates.get('eur_max', 0):.0f})\n"
+        f"- MLC: {rates.get('mlc', 'N/A'):.2f} CUP (rango: {rates.get('mlc_min', 0):.0f}–{rates.get('mlc_max', 0):.0f})\n\n"
+    )
+    if q:
+        prompt += f"Pregunta del usuario: {q}\n\nResponde de forma clara y concisa."
+    else:
+        prompt += "Dame un análisis breve del mercado hoy: tendencias, qué moneda conviene más, y recomendaciones."
+
+    msg = await update.message.reply_text("🧘 Analizando tasas con Zen IA…")
+    resp = await call_zen_ai(prompt)
+    await msg.edit_text(f"🧘 *Análisis de tasas*\n\n{resp}", parse_mode=ParseMode.MARKDOWN)
 
 
 async def _ensure_fresh_rates(update: Update) -> dict | None:
@@ -388,6 +441,633 @@ async def _ensure_fresh_rates(update: Update) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Mode system + GitHub mode
+# ---------------------------------------------------------------------------
+# ponytail: in-memory conversation states, fine for single-process. Persist if multi-worker.
+
+async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch between Normal and GitHub mode."""
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id)
+    user = get_user(chat_id)
+    cur = user["mode"] if user else "normal"
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"{'✅ ' if cur == 'normal' else ''}🌐 Normal", callback_data="mode:normal"),
+            InlineKeyboardButton(f"{'✅ ' if cur == 'github' else ''}🐙 GitHub", callback_data="mode:github"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚙️ *Modo actual:* {cur}\n\nSeleccioná el modo:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def cmd_github(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch to GitHub mode and show dashboard."""
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id)
+    set_mode(chat_id, "github")
+    await _gh_show_menu(update.effective_chat.id, update.message, _ctx)
+
+
+async def cmd_settoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set GitHub personal access token."""
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id)
+    args = ctx.args
+    if args:
+        token = args[0]
+        gh = GitHubClient(token)
+        user_data = gh.validate_token()
+        if user_data:
+            set_github_token(chat_id, token)
+            set_github_user(chat_id, user_data["login"])
+            await update.message.reply_text(
+                f"✅ Token configurado para **{user_data['login']}** 🐙\n\n"
+                f"📦 Repos: {user_data['public_repos']} públicos · {user_data.get('owned_private_repos', 0)} privados\n"
+                f"👥 Seguidores: {user_data['followers']} · Siguiendo: {user_data['following']}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text("❌ Token inválido. Generá uno en GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens")
+    else:
+        conv[chat_id] = {"action": "set_token"}
+        await update.message.reply_text(
+            "🔑 Enviame tu *GitHub Personal Access Token* (classic o fine-grained con repo scope).\n\n"
+            "📌 Crear uno: GitHub.com → Settings → Developer settings → Personal access tokens → Tokens (classic)\n"
+            "✅ Marcá el scope `repo` para acceso completo.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def cmd_mode_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cb = update.callback_query
+    await cb.answer()
+    _, mode = cb.data.split(":", 1)
+    chat_id = update.effective_chat.id
+    set_mode(chat_id, mode)
+    if mode == "github":
+        await _gh_show_menu(chat_id, cb.message, _ctx, edit=True)
+    else:
+        await cb.message.edit_text(
+            "🌐 *Modo Normal activado*\n\nUsá /mode para volver a cambiar o /github para ir a GitHub.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ── GitHub Dashboard / Menú ──────────────────────────────────────────────
+
+# ponytail: button-only navigation, no state machine. If user wants breadcrumbs, add path stack.
+
+async def _gh_show_menu(
+    chat_id: int, msg_or_update: Any, _ctx: ContextTypes.DEFAULT_TYPE,
+    *, edit: bool = False, text: str = "",
+) -> None:
+    """Show the GitHub main dashboard with action buttons."""
+    user = get_user(chat_id)
+    token = user["github_token"] if user else ""
+    gh_user = user["github_user"] if user else ""
+
+    if not token:
+        lines = [
+            "🐙 *GitHub Dashboard*\n",
+            "⚠️ *No hay token configurado.*\n",
+            "Usá /settoken o presioná el botón de abajo para conectar tu cuenta de GitHub.",
+        ]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 Configurar Token", callback_data="gh:settoken")],
+            [InlineKeyboardButton("🌐 Volver a Normal", callback_data="mode:normal")],
+        ])
+        msg = "\n".join(lines)
+    else:
+        profile_line = f"👤 **{gh_user}**" if gh_user else "👤 *Conectado*"
+        lines = [
+            f"🐙 *GitHub Dashboard*\n",
+            f"{profile_line}\n",
+            f"📌 *Acciones:*",
+        ]
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📁 Mis Repos", callback_data="gh:list"),
+                InlineKeyboardButton("🔍 Buscar", callback_data="gh:search"),
+            ],
+            [
+                InlineKeyboardButton("➕ Crear Repo", callback_data="gh:create"),
+                InlineKeyboardButton("📥 Clonar Todo", callback_data="gh:cloneall"),
+            ],
+            [
+                InlineKeyboardButton("👤 Perfil", callback_data="gh:profile"),
+                InlineKeyboardButton("🔑 Cambiar Token", callback_data="gh:settoken"),
+            ],
+            [InlineKeyboardButton("🌐 Volver a Normal", callback_data="mode:normal")],
+        ])
+        msg = "\n".join(lines)
+
+    kwargs = dict(parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    if edit:
+        await msg_or_update.edit_text(text or msg, **kwargs)
+    else:
+        await msg_or_update.reply_text(text or msg, **kwargs)
+
+
+# ── GitHub callback router ───────────────────────────────────────────────
+
+async def _gh_main_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route gh:* callbacks."""
+    cb = update.callback_query
+    await cb.answer()
+    data = cb.data
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    token = user["github_token"] if user else ""
+
+    if data == "gh:menu":
+        return await _gh_show_menu(chat_id, cb.message, ctx, edit=True)
+
+    if data == "gh:settoken":
+        conv[chat_id] = {"action": "set_token"}
+        return await cb.message.edit_text(
+            "🔑 Enviame tu *GitHub Personal Access Token* en un mensaje.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    if data == "gh:profile":
+        return await _gh_profile(chat_id, cb.message, token, ctx)
+
+    if data == "gh:list":
+        return await _gh_list_repos(chat_id, cb.message, token, ctx)
+
+    if data.startswith("gh:list:"):
+        page = int(data.split(":")[-1])
+        return await _gh_list_repos(chat_id, cb.message, token, ctx, page=page)
+
+    if data == "gh:search":
+        conv[chat_id] = {"action": "search_repo"}
+        return await cb.message.edit_text(
+            "🔍 Decime qué querés buscar en GitHub (nombre, lenguaje, tema...):",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    if data == "gh:create":
+        conv[chat_id] = {"action": "create_repo"}
+        return await cb.message.edit_text(
+            "✏️ Enviame el *nombre del repositorio* a crear.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    if data.startswith("gh:create:confirm:"):
+        return await _gh_do_create(chat_id, cb.message, token, data, ctx)
+
+    if data.startswith("gh:detail:"):
+        fn = data.split(":", 2)[-1]
+        return await _gh_show_repo(chat_id, cb.message, token, fn, ctx)
+
+    if data.startswith("gh:delete:"):
+        fn = data.split(":", 2)[-1]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"gh:delete:confirm:{fn}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="gh:menu")],
+        ])
+        return await cb.message.edit_text(
+            f"⚠️ *¿Eliminar `{fn}`?*\n\nEsta acción no se puede deshacer.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
+
+    if data.startswith("gh:delete:confirm:"):
+        return await _gh_do_delete(chat_id, cb.message, token, data, ctx)
+
+    if data.startswith("gh:upload:"):
+        fn = data.split(":", 2)[-1]
+        conv[chat_id] = {"action": "upload_file", "full_name": fn}
+        return await cb.message.edit_text(
+            f"📤 Enviame el *archivo* a subir a `{fn}`.\n\n"
+            f"Luego te pediré la ruta (path) y el mensaje del commit.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    if data.startswith("gh:clone:"):
+        fn = data.split(":", 2)[-1]
+        return await _gh_do_clone(chat_id, cb.message, token, fn, ctx)
+
+    if data == "gh:cloneall":
+        return await _gh_do_clone_all(chat_id, cb.message, token, ctx)
+
+    if data.startswith("gh:branches:"):
+        fn = data.split(":", 2)[-1]
+        return await _gh_list_branches(chat_id, cb.message, token, fn, ctx)
+
+    if data.startswith("gh:commits:"):
+        fn = data.split(":", 2)[-1]
+        return await _gh_list_commits(chat_id, cb.message, token, fn, ctx)
+
+    if data.startswith("gh:fork:"):
+        fn = data.split(":", 2)[-1]
+        return await _gh_do_fork(chat_id, cb.message, token, fn, ctx)
+
+
+# ── GitHub action implementations ────────────────────────────────────────
+
+async def _gh_profile(chat_id: int, msg, token: str, ctx) -> None:
+    if not token:
+        return await msg.edit_text("⚠️ No hay token. Usá /settoken.")
+    try:
+        gh = GitHubClient(token)
+        u = gh.get_user()
+        lines = [
+            f"🐙 *Perfil de GitHub*",
+            f"",
+            f"👤 **{u['login']}**",
+            f"📛 {u.get('name') or '—'}",
+            f"📝 {u.get('bio') or '—'}",
+            f"",
+            f"📦 {u['public_repos']} públicos · {u.get('owned_private_repos', 0)} privados",
+            f"👥 {u['followers']} seguidores · {u['following']} siguiendo",
+            f"⭐ {u.get('total_starred', '?')} estrellas",
+            f"",
+            f"📅 Creado: {u['created_at'][:10]}",
+        ]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]])
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_list_repos(chat_id: int, msg, token: str, ctx, page: int = 1) -> None:
+    if not token:
+        return await msg.edit_text("⚠️ No hay token. Usá /settoken.")
+    try:
+        gh = GitHubClient(token)
+        repos = gh.list_repos(per_page=10)
+        if not repos:
+            return await msg.edit_text("📭 No tenés repositorios.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")],
+            ]))
+
+        lines = ["📁 *Tus repositorios*\n"]
+        buttons = []
+        for r in repos:
+            name = r["full_name"]
+            priv = "🔒" if r["private"] else "🌍"
+            lang = r.get("language") or "?"
+            lines.append(f"{priv} **{name}**  ⭐{r['stargazers_count']}  📐{lang}")
+            buttons.append([InlineKeyboardButton(f"📁 {name.split('/')[1][:30]}", callback_data=f"gh:detail:{name}")])
+
+        buttons.append([InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")])
+        kb = InlineKeyboardMarkup(buttons)
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_show_repo(chat_id: int, msg, token: str, full_name: str, ctx) -> None:
+    if not token:
+        return await msg.edit_text("⚠️ No hay token.")
+    try:
+        gh = GitHubClient(token)
+        r = gh.get_repo(full_name)
+        priv = "🔒" if r["private"] else "🌍"
+        desc = (r.get("description") or "Sin descripción")[:200]
+        lines = [
+            f"{priv} **{full_name}**",
+            f"📝 {desc}",
+            f"",
+            f"⭐ {r['stargazers_count']}  🍴 {r['forks_count']}  📐 {r.get('language') or '?'}",
+            f"📋 {r.get('open_issues_count', 0)} issues  🛠 {r.get('default_branch', 'main')}",
+            f"📅 Último push: {r.get('pushed_at', '?')[:10]}",
+        ]
+        if r.get("homepage"):
+            lines.append(f"🌐 {r['homepage']}")
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📥 Clonar", callback_data=f"gh:clone:{full_name}"),
+                InlineKeyboardButton("🌿 Branches", callback_data=f"gh:branches:{full_name}"),
+            ],
+            [
+                InlineKeyboardButton("📤 Subir Archivo", callback_data=f"gh:upload:{full_name}"),
+                InlineKeyboardButton("📋 Commits", callback_data=f"gh:commits:{full_name}"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Fork", callback_data=f"gh:fork:{full_name}"),
+                InlineKeyboardButton("❌ Eliminar", callback_data=f"gh:delete:{full_name}"),
+            ],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="gh:list")],
+        ])
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_do_create(chat_id: int, msg, token: str, data: str, ctx) -> None:
+    # data = "gh:create:confirm:name:private"
+    parts = data.split(":")
+    name = parts[3] if len(parts) > 3 else ""
+    private = len(parts) > 4 and parts[4] == "private"
+    if not name:
+        return await msg.edit_text("❌ Nombre inválido.")
+    try:
+        gh = GitHubClient(token)
+        r = gh.create_repo(name, private=private)
+        await msg.edit_text(
+            f"✅ Repo creado: **{r['full_name']}**\n"
+            f"🌐 {r['html_url']}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📁 Ver repo", callback_data=f"gh:detail:{r['full_name']}")],
+                [InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")],
+            ]),
+        )
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_do_delete(chat_id: int, msg, token: str, data: str, ctx) -> None:
+    fn = data.split(":", 2)[-1]
+    try:
+        gh = GitHubClient(token)
+        gh.delete_repo(fn)
+        await msg.edit_text(f"✅ Repositorio `{fn}` eliminado.", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]))
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_do_clone(chat_id: int, msg, token: str, full_name: str, ctx) -> None:
+    try:
+        gh = GitHubClient(token)
+        path, filename = gh.download_repo(full_name)
+        await msg.edit_text("⬆️ Subiendo ZIP…")
+        await ctx.bot.send_document(
+            chat_id,
+            document=open(path, "rb"),
+            filename=filename,
+            caption=f"📦 `{full_name}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]),
+        )
+        await msg.delete()
+        if os.path.exists(path):
+            os.unlink(path)
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
+async def _gh_do_clone_all(chat_id: int, msg, token: str, ctx) -> None:
+    try:
+        gh = GitHubClient(token)
+        user = gh.get_user()
+        username = user["login"]
+        await msg.edit_text(f"⏳ Descargando todos los repos de **{username}**…", parse_mode=ParseMode.MARKDOWN)
+        results = gh.download_all_user_repos(username)
+        if not results:
+            return await msg.edit_text("📭 No se pudo descargar ningún repo.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]))
+        await msg.edit_text(f"📦 Subiendo {len(results)} repositorios…")
+        for path, filename in results[:10]:  # ponytail: max 10 ZIPs per batch
+            try:
+                await ctx.bot.send_document(
+                    chat_id, document=open(path, "rb"),
+                    filename=filename,
+                    caption=f"📦 `{filename}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+        await ctx.bot.send_message(chat_id,
+            f"✅ {len(results)} repos descargados.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]))
+        await msg.delete()
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_list_branches(chat_id: int, msg, token: str, full_name: str, ctx) -> None:
+    try:
+        gh = GitHubClient(token)
+        branches = gh.list_branches(full_name)
+        lines = [f"🌿 *Branches de {full_name}*\n"]
+        for b in branches[:30]:
+            lines.append(f"• `{b['name']}`")
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data=f"gh:detail:{full_name}")]]))
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_list_commits(chat_id: int, msg, token: str, full_name: str, ctx) -> None:
+    try:
+        gh = GitHubClient(token)
+        commits = gh.list_commits(full_name)
+        lines = [f"📋 *Últimos commits — {full_name}*\n"]
+        for c in commits[:10]:
+            sha = c["sha"][:7]
+            author = c["commit"]["author"]["name"]
+            msg_text = (c["commit"]["message"] or "").split("\n")[0][:60]
+            lines.append(f"`{sha}` {msg_text} — {author}")
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data=f"gh:detail:{full_name}")]]))
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def _gh_do_fork(chat_id: int, msg, token: str, full_name: str, ctx) -> None:
+    try:
+        gh = GitHubClient(token)
+        r = gh.fork_repo(full_name)
+        await msg.edit_text(
+            f"✅ Fork creado: **{r['full_name']}**\n🌐 {r['html_url']}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]),
+        )
+    except GitHubError as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+# ── Text message router (covers conversation states + GitHub mode) ────────
+
+async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages: conversation workflows and GitHub mode commands."""
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    user_data = get_user(chat_id)
+    token = user_data["github_token"] if user_data else ""
+
+    # Check active conversation
+    state = conv.get(chat_id)
+    if state:
+        action = state["action"]
+
+        if action == "set_token":
+            gh = GitHubClient(text)
+            user_data = gh.validate_token()
+            if user_data:
+                set_github_token(chat_id, text)
+                set_github_user(chat_id, user_data["login"])
+                del conv[chat_id]
+                await update.message.reply_text(
+                    f"✅ Token configurado para **{user_data['login']}**",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🐙 Ir al Dashboard", callback_data="gh:menu")],
+                    ]),
+                )
+            else:
+                await update.message.reply_text("❌ Token inválido. Intentá de nuevo o /cancel.")
+            return
+
+        if action == "create_repo":
+            name = text.strip().replace(" ", "-").lower()
+            if not name:
+                return await update.message.reply_text("❌ Nombre inválido.")
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🌍 Público", callback_data=f"gh:create:confirm:{name}:public"),
+                    InlineKeyboardButton("🔒 Privado", callback_data=f"gh:create:confirm:{name}:private"),
+                ],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="gh:menu")],
+            ])
+            del conv[chat_id]
+            await update.message.reply_text(
+                f"📁 Crear `{name}` como…",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb,
+            )
+            return
+
+        if action == "search_repo":
+            del conv[chat_id]
+            await _gh_do_search(chat_id, update.message, token, text, ctx)
+            return
+
+        if action == "upload_file":
+            full_name = state["full_name"]
+            # User sent a file? Check if it's a document
+            doc = update.message.document
+            if doc:
+                # Save file, then ask for path and commit message
+                conv[chat_id] = {"action": "upload_confirm", "full_name": full_name, "file_id": doc.file_id, "file_name": doc.file_name}
+                await update.message.reply_text(
+                    f"📄 Archivo `{doc.file_name}` recibido.\n\n"
+                    f"Ahora enviame la *ruta* donde guardarlo en el repo (ej: `docs/guia.txt`) "
+                    f"y el *mensaje del commit* separados por un salto de línea.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await update.message.reply_text("❌ Enviame un *archivo* (PDF, imagen, código...).", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if action == "upload_confirm":
+            full_name = state["full_name"]
+            file_id = state["file_id"]
+            file_name = state.get("file_name", "file")
+            lines = text.split("\n", 1)
+            path = lines[0].strip() or file_name
+            commit_msg = lines[1].strip() if len(lines) > 1 else f"Add {path}"
+
+            # Download file from Telegram
+            try:
+                tg_file = await ctx.bot.get_file(file_id)
+                file_bytes = await tg_file.download_as_bytearray()
+                import base64
+                b64 = base64.b64encode(file_bytes).decode()
+
+                gh = GitHubClient(token)
+                gh.create_or_update_file(full_name, path, b64, commit_msg)
+                del conv[chat_id]
+                await update.message.reply_text(
+                    f"✅ Archivo subido a `{full_name}/{path}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Volver", callback_data=f"gh:detail:{full_name}")],
+                    ]),
+                )
+            except GitHubError as e:
+                await update.message.reply_text(f"❌ {e}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error: {e}")
+            return
+
+    # GitHub mode: non-command text shows menu
+    user = get_user(chat_id)
+    if user and user["mode"] == "github" and not text.startswith("/"):
+        await _gh_show_menu(chat_id, update.message, ctx)
+
+
+async def document_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle document uploads for GitHub file upload workflow."""
+    chat_id = update.effective_chat.id
+    state = conv.get(chat_id)
+    if state and state["action"] == "upload_file":
+        full_name = state["full_name"]
+        doc = update.message.document
+        conv[chat_id] = {
+            "action": "upload_confirm",
+            "full_name": full_name,
+            "file_id": doc.file_id,
+            "file_name": doc.file_name,
+        }
+        await update.message.reply_text(
+            f"📄 Archivo `{doc.file_name}` recibido.\n\n"
+            f"Ahora enviame la *ruta* donde guardarlo (ej: `docs/guia.txt`) "
+            f"y el *mensaje del commit* separados por un salto de línea.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def _gh_do_search(chat_id: int, msg, token: str, query: str, ctx) -> None:
+    try:
+        if token:
+            gh = GitHubClient(token)
+            repos = gh.search_repos(query, per_page=5)
+        else:
+            repos = search_repos(query, per_page=5)
+        if not repos:
+            return await msg.reply_text("🔍 Sin resultados.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]))
+        for r in repos:
+            fn = r["full_name"]
+            desc = (r.get("description") or "")[:150]
+            info = (
+                f"📦 **{fn}**\n{desc}\n"
+                f"⭐ {r['stargazers_count']}  🍴 {r['forks_count']}  📐 {r.get('language') or '?'}"
+            )
+            await msg.reply_text(
+                info, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔍 Ver detalle", callback_data=f"gh:detail:{fn}"),
+                ]]),
+            )
+        await msg.reply_text("✅ Resultados arriba.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="gh:menu")]]))
+    except GitHubError as e:
+        await msg.reply_text(f"❌ {e}")
+
+
+async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel current conversation workflow."""
+    chat_id = update.effective_chat.id
+    if chat_id in conv:
+        del conv[chat_id]
+        await update.message.reply_text("❌ Operación cancelada.")
+    else:
+        await update.message.reply_text("🤷 No hay ninguna operación en curso.")
+
+
+# ── Error handler ─────────────────────────────────────────────────────────
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Exception while handling update: %s", ctx.error)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 async def check_rates(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -402,7 +1082,7 @@ async def check_rates(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     save_rates(new)
     log.info("Rates changed – notifying subscribers")
-    subs = load_subs()
+    subs = get_subscribers()
     msg = (
         f"🔄 *Tasas actualizadas*\n\n"
         f"```\n{format_rates(new, header='🔄 ACTUALIZACIÓN')}\n```"
@@ -431,19 +1111,12 @@ async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"\n_Actualizado: {datetime.now().strftime('%d/%m/%Y %H:%M UTC')}_\n"
         f"@nautaii"
     )
-    subs = load_subs()
+    subs = get_subscribers()
     for sid in subs:
         try:
             await ctx.bot.send_message(int(sid), msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             log.warning("Failed daily %s: %s", sid, e)
-
-
-# ---------------------------------------------------------------------------
-# Error handler
-# ---------------------------------------------------------------------------
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error("Exception while handling update: %s", ctx.error)
 
 
 # ---------------------------------------------------------------------------
@@ -456,9 +1129,13 @@ async def post_init(app: Application) -> None:
         BotCommand("tasas", "Cotizaciones USD, EUR, MLC"),
         BotCommand("moneda", "Cotización específica"),
         BotCommand("convertir", "Convertir CUP ↔ USD/EUR/MLC"),
+        BotCommand("asesor", "Análisis IA de tasas"),
         BotCommand("explore", "Buscar repos en GitHub"),
         BotCommand("clone", "Descargar ZIP de GitHub"),
         BotCommand("branches", "Branches de un repo"),
+        BotCommand("github", "Menú GitHub completo"),
+        BotCommand("mode", "Cambiar modo Normal/GitHub"),
+        BotCommand("settoken", "Configurar token de GitHub"),
         BotCommand("sub", "Activar notificaciones"),
         BotCommand("unsub", "Desactivar notificaciones"),
         BotCommand("ayuda", "Ayuda completa"),
@@ -484,6 +1161,26 @@ def _start_health_server() -> None:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     log.info("Health server on port %d", port)
+
+
+# ---------------------------------------------------------------------------
+# Autoping — keep free hosts alive
+# ---------------------------------------------------------------------------
+# ponytail: simple GET loop. Add exponential backoff if host rate-limits.
+def _start_autoping() -> None:
+    if not RENDER_URL:
+        log.info("Autoping disabled (no RENDER_URL)")
+        return
+    def _ping():
+        while True:
+            try:
+                httpx.get(f"{RENDER_URL}/health", timeout=10)
+            except Exception:
+                pass
+            time.sleep(600)  # 10 min
+    t = threading.Thread(target=_ping, daemon=True)
+    t.start()
+    log.info("Autoping every 10min → %s", RENDER_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -639,23 +1336,61 @@ async def gh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
+    init_db()
+
+    # Migrate old subscribers.json → SQLite
+    old_subs = Path("subscribers.json")
+    if old_subs.exists() and old_subs.stat().st_size > 10:
+        try:
+            data = json.loads(old_subs.read_text())
+            for sid_str in data:
+                db_sub(int(sid_str))
+            log.info("Migrated %d subscribers from JSON → SQLite", len(data))
+        except Exception as e:
+            log.warning("Subscriber migration failed: %s", e)
+
     _start_health_server()
+    _start_autoping()
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Commands
+    # Rate commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tasas", tasas))
     app.add_handler(CommandHandler("moneda", moneda))
     app.add_handler(CommandHandler("convertir", convertir))
-    app.add_handler(CommandHandler("explore", cmd_explore))
-    app.add_handler(CommandHandler("clone", cmd_clone))
-    app.add_handler(CommandHandler("branches", cmd_branches))
+    app.add_handler(CommandHandler("asesor", cmd_asesor))
+
+    # Subscribe
     app.add_handler(CommandHandler("sub", subscribe))
     app.add_handler(CommandHandler("unsub", unsubscribe))
     app.add_handler(CommandHandler("ayuda", help_cmd))
-    app.add_handler(InlineQueryHandler(inline_search))
+
+    # Mode / GitHub
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("github", cmd_github))
+    app.add_handler(CommandHandler("settoken", cmd_settoken))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Old-style GitHub commands (keep for compat)
+    app.add_handler(CommandHandler("explore", cmd_explore))
+    app.add_handler(CommandHandler("clone", cmd_clone))
+    app.add_handler(CommandHandler("branches", cmd_branches))
+
+    # Document handler (file upload to GitHub)
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+
+    # Text handler (conversation states + GitHub mode)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(cmd_mode_callback, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(_gh_main_callback, pattern=r"^gh:"))
     app.add_handler(CallbackQueryHandler(gh_callback, pattern=r"^(dl|br)\|."))
+
+    # Inline
+    app.add_handler(InlineQueryHandler(inline_search))
+
     app.add_error_handler(error_handler)
 
     # Schedules

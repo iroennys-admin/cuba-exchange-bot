@@ -39,11 +39,13 @@ euro (EUR) y MLC en Cuba, publicado por **El Toque** (@eltoquecom).
 
 > ⚠️ Codespaces se apaga a los 30 min de inactividad. No es ideal para un bot 24/7.
 
+> 🐙 El bot ahora incluye un **modo GitHub** completo con `/github`. Configurá tu token con `/settoken`.
+
 ### ⚡ Un clic + token
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/iroennys-admin/cuba-exchange-bot)
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/iroennys-admin/cuba-exchange-bot)
-[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=cuba-exchange-bot&type=docker&repository=iroennys-admin/cuba-exchange-bot&branch=master&env%5BBOT_TOKEN%5D=)
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=cuba-exchange-bot&type=docker&repository=iroennys-admin/cuba-exchange-bot&branch=master&env%5BBOT_TOKEN%5D=&env%5BZEN_API_KEY%5D=)
 
 Render, Railway y Koyeb te piden **solo el token** y el bot arranca solo. Sin servidores, sin config.
 
@@ -91,12 +93,15 @@ WantedBy=multi-user.target
 
 ```
 cuba-exchange-bot/
-├── bot.py              # Bot principal (scraper + bot + scheduler)
+├── bot.py              # Bot principal (scraper + bot + scheduler + GitHub)
+├── database.py         # SQLite — usuarios, tokens, suscriptores
+├── github_client.py    # Cliente GitHub API
 ├── requirements.txt    # Dependencias
 ├── README.md           # Esta documentación
 ├── .gitignore
+├── koyeb.yaml          # Config Koyeb
 ├── rates.json          # Últimas tasas (auto-generado)
-└── subscribers.json    # IDs de suscriptores (auto-generado)
+└── subscribers.json    # IDs de suscriptores legacy (auto-generado)
 ```
 
 ## 🔧 Cómo funciona

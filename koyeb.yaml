@@ -9,3 +9,7 @@ env:
     value: ""
     secret: true
     required: true
+  - key: ZEN_API_KEY
+    value: ""
+    secret: true
+    required: false
